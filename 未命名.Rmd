@@ -1,0 +1,168 @@
+
+## 脚本总览
+
+本脚本对比 **乔布斯真实访谈转录稿**(`Transcription_scripts_Session0.pdf`)与
+**ChatGPT 仿写文本**(`chatgpt-Steve Jobs.pdf`)之间的语言风格差异,整体流程如下:
+
+1. 从两份 PDF 中提取文本并切分为句子,合并成一个带来源标签(`original` / `gpt`)的数据框;
+2. 比较两者的**句长分布**(密度图);
+3. 比较两者的**高频词**(Top 20 词频柱状图);
+4. 用 `bing` 情感词典比较两者的**正负面情感词数量**(柱状图);
+5. 将两份文本写入语料库目录,调用 `stylo` 包做 **Cluster/CA 文体分析**(基于最常用词 100–300 个),
+   用于判断两段文本的写作风格是否可被区分开(即 ChatGPT 仿写是否能被检测出来)。
+
+所有图表输出到 `output/` 目录,句子级语料输出到 `corpus/` 目录。
+
+---
+
+```{r}
+# 环境初始化:清空工作区,加载所需的 R 包
+# - pdftools: 读取 PDF 文本
+# - quanteda: 文本量化分析(dfm、词频统计)
+# - tidytext: 整洁文本格式(unnest_tokens、情感词典)
+# - dplyr/ggplot2: 数据处理与可视化
+# - stylo: 文体计量分析(作者风格聚类)
+# - stringr: 字符串处理
+rm(list = ls())
+
+library(pdftools)
+library(quanteda)
+library(tidytext)
+library(dplyr)
+library(ggplot2)
+library(stylo)
+library(stringr)
+
+base_dir <- "/Users/anngiao/Desktop/sarkar"
+
+# 定义两份待比较 PDF 的路径:原始转录稿 vs ChatGPT 仿写稿
+original_pdf <- file.path(base_dir, "Transcription_scripts_Session0.pdf")
+gpt_pdf      <- file.path(base_dir, "chatgpt-Steve Jobs.pdf")
+
+# 定义输出目录:corpus 存放切句后的纯文本语料,output 存放生成的图表
+corpus_dir <- file.path(base_dir, "corpus")
+output_dir <- file.path(base_dir, "output")
+
+dir.create(corpus_dir, showWarnings = FALSE)
+dir.create(output_dir, showWarnings = FALSE)
+```
+
+```{r}
+# 定义函数:将 PDF 转换为句子列表
+# 步骤:提取 PDF 全文 -> 合并多页 -> 去除换行/多余空格 -> 按句末标点(.!?)切分 -> 去除首尾空白与空句
+pdf_to_sentences <- function(path){
+
+  txt <- pdf_text(path)
+  txt <- paste(txt, collapse = " ")
+
+  txt <- gsub("\n", " ", txt)
+  txt <- gsub("\\s+", " ", txt)
+
+  sentences <- unlist(strsplit(txt, "(?<=[.!?])\\s+", perl = TRUE))
+  sentences <- str_trim(sentences)
+  sentences <- sentences[nchar(sentences) > 0]
+
+  return(sentences)
+}
+
+# 分别对原始转录稿和 ChatGPT 仿写稿执行切句,并打印各自的句子数量作为检查
+original_sentences <- pdf_to_sentences(original_pdf)
+gpt_sentences      <- pdf_to_sentences(gpt_pdf)
+
+cat("Original:", length(original_sentences), "\n")
+cat("GPT:", length(gpt_sentences), "\n")
+```
+
+```{r}
+# 将两组句子合并为一个数据框,并打上来源标签(original / gpt),
+# 同时计算每个句子的 token 数量(句子长度),供后续分析使用
+df <- data.frame(
+  text = c(original_sentences, gpt_sentences),
+  source = c(rep("original", length(original_sentences)),
+             rep("gpt", length(gpt_sentences)))
+)
+
+df$sentence_length <- ntoken(df$text)
+```
+
+```{r}
+# 图1:句长分布密度图 —— 对比原始文本与 GPT 文本的句子长度分布差异,并保存为 PNG
+p1 <- ggplot(df, aes(sentence_length, fill = source)) +
+  geom_density(alpha = 0.4) +
+  theme_minimal() +
+  labs(title = "Sentence Length Distribution")
+
+p1
+ggsave(file.path(output_dir, "fig1_sentence_length.png"), p1)
+```
+```{r}
+# 构建 quanteda 语料库和文档特征矩阵(dfm,去除标点),
+# 分别取出原始文本和 GPT 文本各自词频最高的前 20 个词
+corp <- corpus(df$text, docvars = df$source)
+
+dfm_mat <- dfm(tokens(corp, remove_punct = TRUE))
+
+top_original <- topfeatures(dfm_mat[df$source == "original", ], 20)
+top_gpt      <- topfeatures(dfm_mat[df$source == "gpt", ], 20)
+```
+
+```{r}
+# 将两组高频词合并为一个数据框,便于统一绘图
+top_df <- rbind(
+  data.frame(word = names(top_original),
+             freq = as.numeric(top_original),
+             source = "original"),
+  data.frame(word = names(top_gpt),
+             freq = as.numeric(top_gpt),
+             source = "gpt")
+)
+
+# 图2:高频词对比柱状图 —— 按来源分面展示各自 Top 20 高频词及词频,并保存为 PNG
+p2 <- ggplot(top_df, aes(x = reorder(word, freq), y = freq, fill = source)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  facet_wrap(~source, scales = "free") +
+  theme_minimal() +
+  labs(title = "Top Word Frequency Comparison")
+
+p2
+ggsave(file.path(output_dir, "fig2_top_words.png"), p2)
+```
+```{r}
+# 将句子拆分为单词级别的整洁数据(tidytext 格式),
+# 再与 bing 情感词典做内连接,统计每个来源(original/gpt)下正面词与负面词各自出现的次数
+df_tidy <- df %>%
+  unnest_tokens(word, text)
+
+sentiment <- df_tidy %>%
+  inner_join(get_sentiments("bing"), by = "word") %>%
+  count(source, sentiment)
+```
+
+```{r}
+# 图3:情感对比柱状图 —— 对比原始文本与 GPT 文本中正面/负面情感词数量,并保存为 PNG
+p3 <- ggplot(sentiment, aes(sentiment, n, fill = source)) +
+  geom_col(position = "dodge") +
+  theme_minimal() +
+  labs(title = "Sentiment Comparison")
+
+p3
+ggsave(file.path(output_dir, "fig3_sentiment.png"), p3)
+```
+
+```{r}
+# 将切句后的原始文本与 GPT 文本分别写入 corpus 目录(供 stylo 包读取),
+# 然后调用 stylo 做文体计量分析:
+# analysis.type = "CA"(对应分析/聚类分析),使用词频最高的 100~300 个常用词(MFW)作为特征,
+# 用于判断两份文本在写作风格上是否可被区分(即检测 ChatGPT 仿写痕迹)
+writeLines(original_sentences, file.path(corpus_dir, "original.txt"))
+writeLines(gpt_sentences, file.path(corpus_dir, "gpt.txt"))
+
+stylo(
+  gui = FALSE,
+  corpus.dir = corpus_dir,
+  analysis.type = "CA",
+  mfw.min = 100,
+  mfw.max = 300
+)
+```
